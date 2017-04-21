@@ -1,0 +1,591 @@
+commit be275cf9c5f6d0495e9d42286e34cda7fa74d38e
+Author: Diane <adjavon@gmail.com>
+Date:   Mon Apr 24 13:39:34 2017 +0200
+
+    e1000e xdp support
+
+diff --git a/drivers/net/ethernet/intel/e1000e/e1000.h b/drivers/net/ethernet/intel/e1000e/e1000.h
+index 879cca4..50b8a73 100644
+--- a/drivers/net/ethernet/intel/e1000e/e1000.h
++++ b/drivers/net/ethernet/intel/e1000e/e1000.h
+@@ -78,6 +78,8 @@ struct e1000_info;
+ /* How many Tx Descriptors do we need to call netif_wake_queue ? */
+ /* How many Rx Buffers do we bundle into one write to the hardware ? */
+ #define E1000_RX_BUFFER_WRITE		16 /* Must be power of 2 */
++/* How many XDP XMIT buffers to bundle into one xmit transaction */
++#define E1000_XDP_XMIT_BUNDLE_MAX E1000_RX_BUFFER_WRITE
+ 
+ #define AUTO_ALL_MODES			0
+ #define E1000_EEPROM_APME		0x0400
+@@ -149,6 +151,7 @@ struct e1000_ps_page {
+ struct e1000_buffer {
+ 	dma_addr_t dma;
+ 	struct sk_buff *skb;
++	struct page *page;
+ 	union {
+ 		/* Tx */
+ 		struct {
+@@ -163,11 +166,15 @@ struct e1000_buffer {
+ 		struct {
+ 			/* arrays of page information for packet split */
+ 			struct e1000_ps_page *ps_pages;
+-			struct page *page;
+ 		};
+ 	};
+ };
+ 
++struct e1000_buffer_bundle{
++	struct e1000_buffer *buffer;
++	u32 length;
++};
++
+ struct e1000_ring {
+ 	struct e1000_adapter *adapter;	/* back pointer to adapter */
+ 	void *desc;			/* pointer to ring memory  */
+@@ -191,8 +198,27 @@ struct e1000_ring {
+ 	int set_itr;
+ 
+ 	struct sk_buff *rx_skb_top;
++	
++	/*array of XDP buffer information structs*/
++	struct e1000_buffer_bundle *xdp_buffer;
+ };
+ 
++#define E1000_DESC_UNUSED(R)                                            \
++({                                                                      \
++        unsigned int clean = smp_load_acquire(&(R)->next_to_clean);     \
++        unsigned int use = READ_ONCE((R)->next_to_use);                 \
++        (clean > use ? 0 : (R)->count) + clean - use - 1;               \
++})
++ 
++#define E1000_RX_DESC_EXT(R, i)                                         \
++        (&(((union e1000_rx_desc_extended *)((R).desc))[i]))
++#define E1000_GET_DESC(R, i, type)      (&(((struct type *)((R).desc))[i]))
++#define E1000_RX_DESC(R, i)             E1000_GET_DESC(R, i, e1000_rx_desc)
++#define E1000_TX_DESC(R, i)             E1000_GET_DESC(R, i, e1000_tx_desc)
++#define E1000_CONTEXT_DESC(R, i)        E1000_GET_DESC(R, i, e1000_context_desc)
++
++
++
+ /* PHY register snapshot values */
+ struct e1000_phy_regs {
+ 	u16 bmcr;		/* basic mode control register    */
+@@ -275,6 +301,8 @@ struct e1000_adapter {
+ 			     gfp_t gfp);
+ 	struct e1000_ring *rx_ring;
+ 
++	struct bpf_prog *prog; 
++
+ 	u32 rx_int_delay;
+ 	u32 rx_abs_int_delay;
+ 
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index eccf1da..f1e4b15 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -19,6 +19,10 @@
+  * Intel Corporation, 5200 N.E. Elam Young Parkway, Hillsboro, OR 97124-6497
+  */
+ 
++/*
++ * Patched for xdp support
++*/
++
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+ 
+ #include <linux/module.h>
+@@ -43,6 +47,8 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/aer.h>
+ #include <linux/prefetch.h>
++#include <linux/bpf.h>
+ 
+ #include "e1000.h"
+ 
+@@ -57,6 +63,17 @@ static int debug = -1;
+ module_param(debug, int, 0);
+ MODULE_PARM_DESC(debug, "Debug level (0=none,...,16=all)");
+ 
++#define E1000_TX_FLAGS_CSUM            0x00000001
++#define E1000_TX_FLAGS_VLAN            0x00000002
++#define E1000_TX_FLAGS_TSO             0x00000004
++#define E1000_TX_FLAGS_IPV4            0x00000008
++#define E1000_TX_FLAGS_NO_FCS          0x00000010
++#define E1000_TX_FLAGS_HWTSTAMP        0x00000020
++#define E1000_TX_FLAGS_VLAN_MASK       0xffff0000
++#define E1000_TX_FLAGS_VLAN_SHIFT      16
++#define E1000_MAX_TXD_PWR              12
++#define E1000_MAX_DATA_PER_TXD         (1<<E1000_MAX_TXD_PWR)
++
+ static const struct e1000_info *e1000_info_tbl[] = {
+ 	[board_82571]		= &e1000_82571_info,
+ 	[board_82572]		= &e1000_82572_info,
+@@ -1083,10 +1100,18 @@ static void e1000_put_txbuf(struct e1000_ring *tx_ring,
+ 					 buffer_info->length, DMA_TO_DEVICE);
+ 		buffer_info->dma = 0;
+ 	}
++        
++	if (buffer_info->page){
++               put_page(buffer_info->page); //TODO causes machine to freeze
++               buffer_info->page = NULL;
++        }
++
+ 	if (buffer_info->skb) {
+ 		dev_kfree_skb_any(buffer_info->skb);
+ 		buffer_info->skb = NULL;
+ 	}
++
++	
+ 	buffer_info->time_stamp = 0;
+ }
+ 
+@@ -1503,6 +1528,165 @@ static void e1000_consume_page(struct e1000_buffer *bi, struct sk_buff *skb,
+ 	skb->truesize += PAGE_SIZE;
+ }
+ 
++static void e1000_tx_map_rxpage(struct e1000_ring *tx_ring,
++                               struct e1000_buffer *rx_buffer_info,
++                               unsigned int len)
++{
++       struct e1000_buffer *buffer_info;
++       unsigned int i = tx_ring->next_to_use;
++
++       buffer_info = &tx_ring->buffer_info[i];
++
++       buffer_info->length = len;
++       buffer_info->time_stamp = jiffies;
++       buffer_info->mapped_as_page = false;
++       buffer_info->dma = rx_buffer_info->dma;
++       buffer_info->next_to_watch = i;
++       buffer_info->page = rx_buffer_info->page;
++
++       tx_ring->buffer_info[i].skb = NULL;
++       tx_ring->buffer_info[i].segs = 1;
++       tx_ring->buffer_info[i].bytecount = len;
++       tx_ring->buffer_info[i].next_to_watch = i;
++
++       rx_buffer_info->page = NULL;
++}
++static void e1000_tx_queue(struct e1000_ring *tx_ring, int tx_flags, int count)
++{
++	struct e1000_adapter *adapter = tx_ring->adapter;
++	struct e1000_tx_desc *tx_desc = NULL;
++	struct e1000_buffer *buffer_info;
++	u32 txd_upper = 0, txd_lower = E1000_TXD_CMD_IFCS;
++	unsigned int i;
++
++	if (tx_flags & E1000_TX_FLAGS_TSO) {
++		txd_lower |= E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D |
++		    E1000_TXD_CMD_TSE;
++		txd_upper |= E1000_TXD_POPTS_TXSM << 8;
++
++		if (tx_flags & E1000_TX_FLAGS_IPV4)
++			txd_upper |= E1000_TXD_POPTS_IXSM << 8;
++	}
++
++	if (tx_flags & E1000_TX_FLAGS_CSUM) {
++		txd_lower |= E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D;
++		txd_upper |= E1000_TXD_POPTS_TXSM << 8;
++	}
++
++	if (tx_flags & E1000_TX_FLAGS_VLAN) {
++		txd_lower |= E1000_TXD_CMD_VLE;
++		txd_upper |= (tx_flags & E1000_TX_FLAGS_VLAN_MASK);
++	}
++
++	if (unlikely(tx_flags & E1000_TX_FLAGS_NO_FCS))
++		txd_lower &= ~(E1000_TXD_CMD_IFCS);
++
++	if (unlikely(tx_flags & E1000_TX_FLAGS_HWTSTAMP)) {
++		txd_lower |= E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D;
++		txd_upper |= E1000_TXD_EXTCMD_TSTAMP;
++	}
++
++	i = tx_ring->next_to_use;
++
++	do {
++		buffer_info = &tx_ring->buffer_info[i];
++		tx_desc = E1000_TX_DESC(*tx_ring, i);
++		tx_desc->buffer_addr = cpu_to_le64(buffer_info->dma);
++		tx_desc->lower.data = cpu_to_le32(txd_lower |
++						  buffer_info->length);
++		tx_desc->upper.data = cpu_to_le32(txd_upper);
++
++		i++;
++		if (i == tx_ring->count)
++			i = 0;
++	} while (--count > 0);
++
++	tx_desc->lower.data |= cpu_to_le32(adapter->txd_cmd);
++
++	/* txd_cmd re-enables FCS, so we'll re-disable it here as desired. */
++	if (unlikely(tx_flags & E1000_TX_FLAGS_NO_FCS))
++		tx_desc->lower.data &= ~(cpu_to_le32(E1000_TXD_CMD_IFCS));
++
++	/* Force memory writes to complete before letting h/w
++	 * know there are new descriptors to fetch.  (Only
++	 * applicable for weak-ordered memory model archs,
++	 * such as IA-64).
++	 */
++	wmb();
++
++	tx_ring->next_to_use = i;
++}
++
++static void e1000_xmit_raw_frame(struct e1000_buffer *rx_buffer_info,
++                                u32 len,
++                                struct e1000_adapter *adapter,
++                                struct net_device *netdev,
++                                struct e1000_ring *tx_ring)
++{
++       const struct netdev_queue *txq = netdev_get_tx_queue(netdev, 0);
++
++       if (len > E1000_MAX_DATA_PER_TXD)
++               return;
++
++       if (E1000_DESC_UNUSED(tx_ring) < 2)
++               return;
++
++       if (netif_xmit_frozen_or_stopped(txq))
++               return;
++
++       e1000_tx_map_rxpage(tx_ring, rx_buffer_info, len);
++       netdev_sent_queue(netdev, len);
++       e1000_tx_queue(tx_ring, 0/*tx_flags*/, 1);
++}
++
++static void e1000_xdp_xmit_bundle(struct e1000_buffer_bundle *buffer_info,
++                                 struct net_device *netdev,
++                                 struct e1000_adapter *adapter)
++{
++       struct netdev_queue *txq = netdev_get_tx_queue(netdev, 0);
++       struct e1000_ring *tx_ring = adapter->tx_ring;
++       struct e1000_hw *hw = &adapter->hw;
++       int i = 0;
++
++       /* e1000 only support a single txq at the moment so the queue is being
++        * shared with stack. To support this requires locking to ensure the
++        * stack and XDP are not running at the same time. Devices with
++        * multiple queues should allocate a separate queue space.
++        *
++        * To amortize the locking cost e1000 bundles the xmits and send up to
++        * E1000_XDP_XMIT_BUNDLE_MAX.
++        */
++       HARD_TX_LOCK(netdev, txq, smp_processor_id());
++
++       for (; i < E1000_XDP_XMIT_BUNDLE_MAX && buffer_info[i].buffer; i++) {
++               e1000_xmit_raw_frame(buffer_info[i].buffer,
++                                    buffer_info[i].length,
++                                    adapter, netdev, tx_ring);
++               buffer_info[i].buffer = NULL;
++               buffer_info[i].length = 0;
++       }
++
++       /* kick hardware to send bundle and return control back to the stack */
++       writel(tx_ring->next_to_use, hw->hw_addr + E1000_TDT(0));
++       mmiowb();
++
++       HARD_TX_UNLOCK(netdev, txq);
++}
++
++static inline int e1000_call_bpf(struct bpf_prog *prog, void *data,
++                                unsigned int length)
++{
++       struct xdp_buff xdp;
++       int ret;
++
++       xdp.data = data;
++       xdp.data_end = data + length;
++       ret = BPF_PROG_RUN(prog, (void *)&xdp);
++
++       return ret;
++}
++
++
+ /**
+  * e1000_clean_jumbo_rx_irq - Send received data up the network stack; legacy
+  * @adapter: board private structure
+@@ -1518,13 +1702,18 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 	struct pci_dev *pdev = adapter->pdev;
+ 	union e1000_rx_desc_extended *rx_desc, *next_rxd;
+ 	struct e1000_buffer *buffer_info, *next_buffer;
++        struct bpf_prog *prog; 
+ 	u32 length, staterr;
+ 	unsigned int i;
+-	int cleaned_count = 0;
++	int cleaned_count = 0, xdp_xmit=0;
+ 	bool cleaned = false;
+ 	unsigned int total_rx_bytes = 0, total_rx_packets = 0;
+ 	struct skb_shared_info *shinfo;
+ 
++        struct e1000_buffer_bundle *xdp_bundle = rx_ring->xdp_buffer;
++        rcu_read_lock(); /*rcu lock needed here to protect xdp programs*/
++        prog = READ_ONCE(adapter->prog);
++
+ 	i = rx_ring->next_to_clean;
+ 	rx_desc = E1000_RX_DESC_EXT(*rx_ring, i);
+ 	staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
+@@ -1551,6 +1740,50 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 
+ 		cleaned = true;
+ 		cleaned_count++;
++                length = le16_to_cpu(rx_desc->wb.upper.length);
++
++                if (prog) {
++                       struct page *p = buffer_info->page;
++                       dma_addr_t dma = buffer_info->dma;
++                       int act;
++
++                       if (unlikely(!(staterr & E1000_RXD_STAT_EOP))) {
++                               /* attached bpf disallows larger than page
++                                * packets, so this is hw error or corruption
++                                */
++                               pr_info_once("%s buggy !eop\n", netdev->name);
++                               break;
++                       }
++                       if (unlikely(rx_ring->rx_skb_top)) {
++                               pr_info_once("%s ring resizing bug\n",
++                                            netdev->name);
++                               break;
++                       }
++                       dma_sync_single_for_cpu(&pdev->dev, dma,
++                                               length, DMA_FROM_DEVICE);
++                       act = e1000_call_bpf(prog, page_address(p), length);
++                       switch (act) {
++                       case XDP_PASS:
++                               break;
++                       case XDP_TX:
++                               xdp_bundle[xdp_xmit].buffer = buffer_info;
++                              xdp_bundle[xdp_xmit].length = length;
++                              dma_sync_single_for_device(&pdev->dev,
++                                                          dma,
++                                                          length,
++                                                          DMA_TO_DEVICE);
++                       case XDP_DROP:
++                       default:
++                               /* re-use mapped page. keep buffer_info->dma
++                                * as-is, so that e1000_alloc_jumbo_rx_buffers
++                                * only needs to put it back into rx ring
++                                */
++                               total_rx_bytes += length;
++                               total_rx_packets++;
++                               goto next_desc;
++                       }
++                }
++
+ 		dma_unmap_page(&pdev->dev, buffer_info->dma, PAGE_SIZE,
+ 			       DMA_FROM_DEVICE);
+ 		buffer_info->dma = 0;
+@@ -1651,9 +1884,12 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 
+ 		/* return some buffers to hardware, one at a time is too slow */
+ 		if (unlikely(cleaned_count >= E1000_RX_BUFFER_WRITE)) {
++			if(xdp_xmit)
++				e1000_xdp_xmit_bundle(xdp_bundle,netdev,adapter);
+ 			adapter->alloc_rx_buf(rx_ring, cleaned_count,
+ 					      GFP_ATOMIC);
+ 			cleaned_count = 0;
++			xdp_xmit = 0;
+ 		}
+ 
+ 		/* use prefetched values */
+@@ -1662,6 +1898,7 @@ static bool e1000_clean_jumbo_rx_irq(struct e1000_ring *rx_ring, int *work_done,
+ 
+ 		staterr = le32_to_cpu(rx_desc->wb.upper.status_error);
+ 	}
++	rcu_read_unlock(); 
+ 	rx_ring->next_to_clean = i;
+ 
+ 	cleaned_count = e1000_desc_unused(rx_ring);
+@@ -3191,7 +3428,7 @@ static void e1000_configure_rx(struct e1000_adapter *adapter)
+ 		    sizeof(union e1000_rx_desc_packet_split);
+ 		adapter->clean_rx = e1000_clean_rx_irq_ps;
+ 		adapter->alloc_rx_buf = e1000_alloc_rx_buffers_ps;
+-	} else if (adapter->netdev->mtu > ETH_FRAME_LEN + ETH_FCS_LEN) {
++	} else if (adapter->netdev->mtu > ETH_FRAME_LEN + ETH_FCS_LEN || adapter->prog) { 
+ 		rdlen = rx_ring->count * sizeof(union e1000_rx_desc_extended);
+ 		adapter->clean_rx = e1000_clean_jumbo_rx_irq;
+ 		adapter->alloc_rx_buf = e1000_alloc_jumbo_rx_buffers;
+@@ -5367,15 +5604,6 @@ static void e1000_watchdog_task(struct work_struct *work)
+ 			  round_jiffies(jiffies + 2 * HZ));
+ }
+ 
+-#define E1000_TX_FLAGS_CSUM		0x00000001
+-#define E1000_TX_FLAGS_VLAN		0x00000002
+-#define E1000_TX_FLAGS_TSO		0x00000004
+-#define E1000_TX_FLAGS_IPV4		0x00000008
+-#define E1000_TX_FLAGS_NO_FCS		0x00000010
+-#define E1000_TX_FLAGS_HWTSTAMP		0x00000020
+-#define E1000_TX_FLAGS_VLAN_MASK	0xffff0000
+-#define E1000_TX_FLAGS_VLAN_SHIFT	16
+-
+ static int e1000_tso(struct e1000_ring *tx_ring, struct sk_buff *skb,
+ 		     __be16 protocol)
+ {
+@@ -5595,72 +5823,6 @@ static int e1000_tx_map(struct e1000_ring *tx_ring, struct sk_buff *skb,
+ 	return 0;
+ }
+ 
+-static void e1000_tx_queue(struct e1000_ring *tx_ring, int tx_flags, int count)
+-{
+-	struct e1000_adapter *adapter = tx_ring->adapter;
+-	struct e1000_tx_desc *tx_desc = NULL;
+-	struct e1000_buffer *buffer_info;
+-	u32 txd_upper = 0, txd_lower = E1000_TXD_CMD_IFCS;
+-	unsigned int i;
+-
+-	if (tx_flags & E1000_TX_FLAGS_TSO) {
+-		txd_lower |= E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D |
+-		    E1000_TXD_CMD_TSE;
+-		txd_upper |= E1000_TXD_POPTS_TXSM << 8;
+-
+-		if (tx_flags & E1000_TX_FLAGS_IPV4)
+-			txd_upper |= E1000_TXD_POPTS_IXSM << 8;
+-	}
+-
+-	if (tx_flags & E1000_TX_FLAGS_CSUM) {
+-		txd_lower |= E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D;
+-		txd_upper |= E1000_TXD_POPTS_TXSM << 8;
+-	}
+-
+-	if (tx_flags & E1000_TX_FLAGS_VLAN) {
+-		txd_lower |= E1000_TXD_CMD_VLE;
+-		txd_upper |= (tx_flags & E1000_TX_FLAGS_VLAN_MASK);
+-	}
+-
+-	if (unlikely(tx_flags & E1000_TX_FLAGS_NO_FCS))
+-		txd_lower &= ~(E1000_TXD_CMD_IFCS);
+-
+-	if (unlikely(tx_flags & E1000_TX_FLAGS_HWTSTAMP)) {
+-		txd_lower |= E1000_TXD_CMD_DEXT | E1000_TXD_DTYP_D;
+-		txd_upper |= E1000_TXD_EXTCMD_TSTAMP;
+-	}
+-
+-	i = tx_ring->next_to_use;
+-
+-	do {
+-		buffer_info = &tx_ring->buffer_info[i];
+-		tx_desc = E1000_TX_DESC(*tx_ring, i);
+-		tx_desc->buffer_addr = cpu_to_le64(buffer_info->dma);
+-		tx_desc->lower.data = cpu_to_le32(txd_lower |
+-						  buffer_info->length);
+-		tx_desc->upper.data = cpu_to_le32(txd_upper);
+-
+-		i++;
+-		if (i == tx_ring->count)
+-			i = 0;
+-	} while (--count > 0);
+-
+-	tx_desc->lower.data |= cpu_to_le32(adapter->txd_cmd);
+-
+-	/* txd_cmd re-enables FCS, so we'll re-disable it here as desired. */
+-	if (unlikely(tx_flags & E1000_TX_FLAGS_NO_FCS))
+-		tx_desc->lower.data &= ~(cpu_to_le32(E1000_TXD_CMD_IFCS));
+-
+-	/* Force memory writes to complete before letting h/w
+-	 * know there are new descriptors to fetch.  (Only
+-	 * applicable for weak-ordered memory model archs,
+-	 * such as IA-64).
+-	 */
+-	wmb();
+-
+-	tx_ring->next_to_use = i;
+-}
+-
+ #define MINIMUM_DHCP_PACKET_SIZE 282
+ static int e1000_transfer_dhcp_info(struct e1000_adapter *adapter,
+ 				    struct sk_buff *skb)
+@@ -6970,6 +7132,54 @@ static int e1000_set_features(struct net_device *netdev,
+ 	return 0;
+ }
+ 
++static int e1000_xdp_set(struct net_device *netdev, struct bpf_prog *prog)
++{
++       struct e1000_adapter *adapter = netdev_priv(netdev);
++       struct bpf_prog *old_prog;
++       if (!adapter->rx_ring[0].xdp_buffer) {
++               int size = sizeof(struct e1000_buffer_bundle) *
++                               E1000_XDP_XMIT_BUNDLE_MAX;
++
++               adapter->rx_ring[0].xdp_buffer = vzalloc(size);
++               if (!adapter->rx_ring[0].xdp_buffer)
++                       return -ENOMEM;
++       }
++
++       old_prog = xchg(&adapter->prog, prog);
++       if (old_prog) {
++               synchronize_net();
++               bpf_prog_put(old_prog);
++       }
++
++       if (netif_running(netdev))
++               e1000e_reinit_locked(adapter);
++       else
++               e1000e_reset(adapter);
++       return 0;
++}
++
++static bool e1000_xdp_attached(struct net_device *dev)
++{
++       struct e1000_adapter *priv = netdev_priv(dev);
++
++       return !!priv->prog;
++}
++
++static int e1000_xdp(struct net_device *dev, struct netdev_xdp *xdp)
++{
++
++       switch (xdp->command) {
++       case XDP_SETUP_PROG:
++               return e1000_xdp_set(dev, xdp->prog);
++       case XDP_QUERY_PROG:
++               xdp->prog_attached = e1000_xdp_attached(dev);
++               return 0;
++       default:
++               return -EINVAL;
++       }
++}
++
++
+ static const struct net_device_ops e1000e_netdev_ops = {
+ 	.ndo_open		= e1000e_open,
+ 	.ndo_stop		= e1000e_close,
+@@ -6988,6 +7198,7 @@ static const struct net_device_ops e1000e_netdev_ops = {
+ 	.ndo_poll_controller	= e1000_netpoll,
+ #endif
+ 	.ndo_set_features = e1000_set_features,
++	.ndo_xdp		= e1000_xdp,
+ 	.ndo_fix_features = e1000_fix_features,
+ 	.ndo_features_check	= passthru_features_check,
+ };
+@@ -7281,7 +7492,6 @@ static int e1000_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 	/* initialize the wol settings based on the eeprom settings */
+ 	adapter->wol = adapter->eeprom_wol;
+ 
+-	/* make sure adapter isn't asleep if manageability is enabled */
+ 	if (adapter->wol || (adapter->flags & FLAG_MNG_PT_ENABLED) ||
+ 	    (hw->mac.ops.check_mng_mode(hw)))
+ 		device_wakeup_enable(&pdev->dev);
+@@ -7389,6 +7599,13 @@ static void e1000_remove(struct pci_dev *pdev)
+ 	/* Don't lie to e1000_close() down the road. */
+ 	if (!down)
+ 		clear_bit(__E1000_DOWN, &adapter->state);
++
++        if(adapter->prog)
++               bpf_prog_put(adapter->prog); 
++	
++	if(adapter->rx_ring[0].xdp_buffer)
++		vfree(adapter->rx_ring[0].xdp_buffer);
++
+ 	unregister_netdev(netdev);
+ 
+ 	if (pci_dev_run_wake(pdev))
+@@ -7552,6 +7769,8 @@ static int __init e1000_init_module(void)
+ 	pr_info("Intel(R) PRO/1000 Network Driver - %s\n",
+ 		e1000e_driver_version);
+ 	pr_info("Copyright(c) 1999 - 2015 Intel Corporation.\n");
++	
++	pr_info("e1000e driver patched for XDP support.\n");
+ 
+ 	return pci_register_driver(&e1000_driver);
+ }
